@@ -1,0 +1,744 @@
+import math
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import csv
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+# Constantes físicas
+PRESSAO_ATMOSFERICA = 101325
+R_AR = 287.05
+MU_0 = 1.716e-5
+T_0 = 273.15
+C_SUTHERLAND = 110.4
+
+# Dados de rugosidade e métodos de atrito
+RUGOSIDADES = {
+    "Aço carbono (Não Revestido)": 0.00003,
+    "PVC": 0.00003,
+    "Alumínio": 0.00003,
+    "Aço Galvanizado (Costuras em Espiral)": 0.00009,
+    "Aço Galvanizado (Imersão a Quente)": 0.00015,
+    "Fibra de Vidro (Rígido)": 0.0009,
+    "Fibra de Vidro (Revestido)": 0.0009,
+    "Fibra de Vidro (Spray)": 0.003,
+    "Duto Metálico Flexível": 0.003,
+    "Duto Flexível (Tecido e Fio)": 0.003,
+    "Concreto": 0.003
+}
+
+FATORES_ATRITO = ["Haaland", "Sousa-Cunha-Marques", "Barr"]
+
+# Constantes para padronização dos tamanhos dos campos
+LABEL_WIDTH = 25   # Tamanho fixo para os rótulos
+ENTRY_WIDTH = 25   # Tamanho fixo para os campos de entrada
+
+# --- Componentes Gráficos ---
+class ModernButton(ttk.Button):
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        self.configure(style='Modern.TButton')
+
+class EditableTreeview(ttk.Treeview):
+    def __init__(self, master, editable_columns=None, **kw):
+        if "selectmode" not in kw:
+            kw["selectmode"] = "extended"
+        super().__init__(master, **kw)
+        self.editing = False
+        self.style = ttk.Style()
+        self.style.configure("Modern.Treeview", rowheight=30, font=('Segoe UI', 10), background='#ffffff')
+        self.style.configure("Modern.Treeview.Heading", font=('Segoe UI', 10, 'bold'),
+                             background='#007ACC', foreground='white')
+        self.style.map("Modern.Treeview.Heading", background=[('active', '#34495e')])
+        self.configure(style='Modern.Treeview')
+        self.editable_columns = editable_columns if editable_columns is not None else []
+        self.bind("<Double-1>", self.on_double_click)
+        self.bind("<Control-ButtonPress-1>", self.on_ctrl_click_start)
+        self.bind("<Shift-ButtonPress-1>", self.on_shift_click_start)
+        self.bind("<B1-Motion>", self.on_drag)
+        self.bind("<ButtonRelease-1>", self.on_drag_release)
+        self.drag_selecting = False
+        self.drag_action = None
+        self.drag_processed = set()
+        self.tag_configure('oddrow', background='#f8f9fa')
+        self.tag_configure('evenrow', background='#ffffff')
+
+    def on_double_click(self, event):
+        region = self.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        column = self.identify_column(event.x)
+        column_index = int(column[1:]) - 1
+        if column_index not in self.editable_columns:
+            return
+        row_id = self.identify_row(event.y)
+        if not row_id:
+            return
+        self.start_edit(row_id, column_index)
+
+    def on_ctrl_click_start(self, event):
+        row_id = self.identify_row(event.y)
+        if row_id:
+            self.selection_add(row_id)
+            self.drag_action = "add"
+            self.drag_selecting = True
+            self.drag_processed = {row_id}
+        return "break"
+
+    def on_shift_click_start(self, event):
+        row_id = self.identify_row(event.y)
+        if row_id:
+            self.selection_remove(row_id)
+            self.drag_action = "remove"
+            self.drag_selecting = True
+            self.drag_processed = {row_id}
+        return "break"
+
+    def on_drag(self, event):
+        if self.drag_selecting:
+            row_id = self.identify_row(event.y)
+            if row_id and row_id not in self.drag_processed:
+                self.drag_processed.add(row_id)
+                if self.drag_action == "add":
+                    self.selection_add(row_id)
+                elif self.drag_action == "remove":
+                    self.selection_remove(row_id)
+
+    def on_drag_release(self, event):
+        self.drag_selecting = False
+        self.drag_action = None
+        self.drag_processed = set()
+
+    def start_edit(self, row_id, column_index):
+        self.editing = True
+        self.selection_set(row_id)
+        self.focus(row_id)
+        column = f'#{column_index + 1}'
+        current_value = self.item(row_id, 'values')[column_index]
+        x, y, width, height = self.bbox(row_id, column)
+        entry = ttk.Entry(self, font=('Segoe UI', 10))
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.insert(0, current_value)
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self.save_edit(entry, row_id, column_index, True))
+        entry.bind("<FocusOut>", lambda e: self.save_edit(entry, row_id, column_index))
+
+    def save_edit(self, entry, row_id, column_index, navigate=False):
+        self.editing = False
+        new_value = entry.get()
+        current_values = list(self.item(row_id, 'values'))
+        current_values[column_index] = new_value
+        self.item(row_id, values=current_values)
+        entry.destroy()
+        if navigate:
+            next_id = self.next(row_id)
+            if next_id:
+                self.after(50, lambda: self.start_edit(next_id, column_index))
+                self.see(next_id)
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip = None
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.leave)
+
+    def enter(self, event=None):
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        self.tooltip = tk.Toplevel(self.widget)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+        label = ttk.Label(self.tooltip, text=self.text, background="#ffffe0", relief="solid", borderwidth=1)
+        label.pack()
+
+    def leave(self, event=None):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
+# --- Funções de Cálculo ---
+def calcular_densidade_ar(temperatura_celsius):
+    return PRESSAO_ATMOSFERICA / (R_AR * (temperatura_celsius + 273.15))
+
+def calcular_viscosidade_ar(temperatura_celsius):
+    T = temperatura_celsius + 273.15
+    return MU_0 * (T/T_0)**1.5 * (T_0 + C_SUTHERLAND)/(T + C_SUTHERLAND)
+
+def numero_reynolds(v, D, ρ, μ):
+    return (ρ * v * D) / μ
+
+def fator_atrito_haaland(Re, ε, D):
+    return (1/(-1.8 * math.log10((ε/(3.7*D))**1.11 + 6.9/Re)))**2
+
+def fator_atrito_sousa_cunha_marques(Re, ε, D):
+    return (1/(-2 * math.log10(ε/(3.7*D) - (5.15/Re)*math.log10(ε/(3.7*D) + 5.09/Re**0.87))))**2
+
+def fator_atrito_barr(Re, ε, D):
+    f = 0.02
+    for _ in range(100):
+        f = (1/(-2 * math.log10(ε/(3.7*D) + 5.15/Re**0.87)))**2
+    return f
+
+def perda_carga_darcy(ρ, v, D, f):
+    return f * (ρ * v**2) / (2 * D)
+
+def diametro_equivalente(h, w):
+    return (2 * h * w) / (h + w)
+
+def calcular_velocidade(Q, h, w):
+    return Q / (h * w)
+
+def dimensionar_duto(ΔP_min, ΔP_max, temp, Q, metodo, material, w_min, w_max, h_min, h_max, max_ratio, v_max):
+    ρ = calcular_densidade_ar(temp)
+    μ = calcular_viscosidade_ar(temp)
+    ε = RUGOSIDADES.get(material, 0.00003)
+    resultados = []
+    Q = Q / 3600  # converte de m³/h para m³/s
+    for w_mm in range(w_min, w_max + 10, 10):
+        w = w_mm / 1000
+        for h_mm in range(h_min, min(w_mm, h_max) + 10, 10):
+            h = h_mm / 1000
+            if max_ratio > 0:
+                if h_mm == 0 or w_mm == 0:
+                    continue
+                ratio = max(w_mm/h_mm, h_mm/w_mm)
+                if ratio > max_ratio:
+                    continue
+            D_eq = diametro_equivalente(h, w)
+            v = calcular_velocidade(Q, h, w)
+            if v > v_max:
+                continue  # descarta se ultrapassar o limitador de velocidade
+            Re = numero_reynolds(v, D_eq, ρ, μ)
+            if metodo == "Haaland":
+                f = fator_atrito_haaland(Re, ε, D_eq)
+            elif metodo == "Sousa-Cunha-Marques":
+                f = fator_atrito_sousa_cunha_marques(Re, ε, D_eq)
+            else:
+                f = fator_atrito_barr(Re, ε, D_eq)
+            ΔP = perda_carga_darcy(ρ, v, D_eq, f)
+            if ΔP_min <= ΔP <= ΔP_max:
+                resultados.append((w_mm, h_mm, v, ΔP))
+    return resultados
+
+# --- Aplicativo Principal ---
+class DuctFlow(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("DuctFlow")
+        self.geometry("1366x768")
+        self.configure_styles()
+        self.configure(bg=self.colors['background'])
+        self.criar_menu()
+        self.criar_widgets()
+        self.carregar_defaults()
+        self.adicionar_watermark()
+        self.center_window()
+        self.bind_events()
+        self.current_file = None
+        self.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def configure_styles(self):
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        # Paleta HVAC
+        self.colors = {
+            'primary': '#007ACC',
+            'background': '#E6F2F8',
+            'text': '#000000'
+        }
+        self.style.configure('.', background=self.colors['background'], foreground=self.colors['text'])
+        self.style.configure('TFrame', background=self.colors['background'])
+        self.style.configure('TLabel', background=self.colors['background'], foreground=self.colors['text'], font=('Segoe UI', 10))
+        self.style.configure('Header.TLabel', font=('Segoe UI', 12, 'bold'), foreground=self.colors['primary'])
+        self.style.configure('Modern.TButton', font=('Segoe UI', 10, 'bold'), borderwidth=0,
+                             background=self.colors['primary'], foreground='white', padding=8, relief='flat')
+        self.style.map('Modern.TButton', background=[('active', self.colors['primary'])],
+                       foreground=[('active', 'white'), ('pressed', 'white')])
+        self.style.configure('Modern.TEntry', fieldbackground='white', bordercolor='#CED4DA', padding=5)
+        self.style.configure('Modern.TCombobox', fieldbackground='white', arrowcolor=self.colors['primary'],
+                             bordercolor='#CED4DA', padding=5)
+
+    def bind_events(self):
+        self.bind("<Control-a>", lambda e: self.importar_csv())
+        self.bind("<Control-s>", lambda e: self.salvar())
+
+    def criar_menu(self):
+        menubar = tk.Menu(self)
+        # Menu Arquivo
+        filemenu = tk.Menu(menubar, tearoff=0)
+        filemenu.add_command(label="Novo", command=self.novo)
+        filemenu.add_command(label="Abrir", command=self.importar_csv)
+        filemenu.add_command(label="Salvar", command=self.salvar)
+        filemenu.add_command(label="Salvar Como...", command=self.salvar_como)
+        filemenu.add_command(label="Gerar Planilha Personalizada", command=self.gerar_planilha_personalizada)
+        filemenu.add_separator()
+        filemenu.add_command(label="Sair", command=self.on_closing)
+        menubar.add_cascade(label="Arquivo", menu=filemenu)
+
+        # Menu Sobre
+        sobremenu = tk.Menu(menubar, tearoff=0)
+        sobremenu.add_command(label="Tutorial e Informações", command=self.mostrar_sobre)
+        menubar.add_cascade(label="Sobre", menu=sobremenu)
+
+        self.config(menu=menubar)
+
+    def mostrar_sobre(self):
+        texto = (
+            "DuctFlow 1.0\n"
+            "-------------------------\n"
+            "Bem-vindo ao DuctFlow, uma ferramenta profissional para o dimensionamento de dutos para HVAC.\n\n"
+            "Funcionalidades:\n"
+            "  • Cálculo automático das dimensões do duto com base nas condições do ar e na faixa de fricção desejada.\n"
+            "  • Visualização, edição e organização dos resultados por meio de tabelas interativas.\n"
+            "  • Geração de planilhas personalizadas com os parâmetros adotados e os resultados obtidos, formatados com vírgula como separador decimal.\n\n"
+            "Atalhos e Bindings:\n"
+            "  • Duplo clique: Inicia a edição de uma célula (em campos editáveis).\n"
+            "  • Enter: Confirma a edição ou inicia a edição da linha selecionada.\n"
+            "  • Delete: Remove a linha selecionada.\n"
+            "  • Tab: Inverte os valores de largura e altura da linha selecionada.\n"
+            "  • Ctrl + Clique: Adiciona linhas à seleção para multiseleção.\n"
+            "  • Shift + Clique: Remove linhas da seleção.\n"
+            "  • Botão do meio + Arraste: Reordena as linhas na tabela de resultados escolhidos.\n"
+            "  • Ctrl+a: Importa um arquivo CSV.\n"
+            "  • Ctrl+s: Salva os dados atuais.\n\n"
+            "Desenvolvido por David Diogenes ®\n"
+            "Agradecemos o apoio e o feedback de todos os usuários."
+        )
+        messagebox.showinfo("Sobre DuctFlow", texto)
+
+    def novo(self):
+        self.tree_selecionados.delete(*self.tree_selecionados.get_children())
+        self.current_file = None
+
+    def criar_widgets(self):
+        main_frame = ttk.Frame(self)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+
+        # Painel esquerdo
+        left_frame = ttk.Frame(main_frame, width=500)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
+        header = ttk.Frame(left_frame)
+        header.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(header, text="DUCTFLOW", style='Header.TLabel').pack(side=tk.LEFT)
+
+        input_container = ttk.Frame(left_frame)
+        input_container.pack(fill=tk.BOTH, expand=True)
+
+        # Grupos de parâmetros com campos padronizados
+        grupos = [
+            {'title': "Condições do Ar", 'fields': [
+                ('Vazão (m³/h):', 'vazao', '1000'),
+                ('Temperatura (°C):', 'temp', '25'),
+                ('Velocidade Limite (m/s):', 'vel_max', '15')
+            ]},
+            {'title': "Fricção", 'fields': [
+                ('Fricção Máxima (Pa/m):', 'perda_max', '1.3'),
+                ('Fricção Mínima (Pa/m):', 'perda_min', '1.0')
+            ]},
+            {'title': "Dimensões do Duto", 'fields': [
+                ('Largura Máxima (mm):', 'w_max', '2000'),
+                ('Largura Mínima (mm):', 'w_min', '100'),
+                ('Altura Máxima (mm):', 'h_max', '2000'),
+                ('Altura Mínima (mm):', 'h_min', '100'),
+                ('Relação Máxima L/A:', 'max_ratio', '3.0')
+            ]}
+        ]
+        self.entries = {}
+        for grupo in grupos:
+            frame = ttk.LabelFrame(input_container, text=grupo['title'])
+            frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+            for texto, tag, default in grupo['fields']:
+                self.create_entry(frame, texto, default, tag)
+
+        # Configurações Avançadas (exceto Velocidade Limite)
+        adv_frame = ttk.LabelFrame(input_container, text="Configurações Avançadas")
+        adv_frame.pack(fill=tk.X, padx=5, pady=5, ipady=5)
+        frame_adv = ttk.Frame(adv_frame)
+        frame_adv.pack(fill=tk.X, padx=5, pady=5)
+        self.material = self.create_combobox(frame_adv, "Material do Duto:", list(RUGOSIDADES.keys()), 0, width=LABEL_WIDTH, combo_width=35)
+        self.metodo = self.create_combobox(frame_adv, "Fator de Atrito:", FATORES_ATRITO, 0, width=LABEL_WIDTH, combo_width=ENTRY_WIDTH)
+
+        # Botão "Executar Cálculo"
+        ModernButton(left_frame, text="▶ EXECUTAR CÁLCULO", command=self.calcular).pack(pady=15, fill=tk.X)
+
+        # Painel direito para resultados
+        right_frame = ttk.Frame(main_frame)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        resultados_frame = ttk.LabelFrame(right_frame, text="Resultados do Cálculo")
+        resultados_frame.pack(fill=tk.BOTH, expand=True)
+        columns = ('Largura (mm)', 'Altura (mm)', 'Velocidade (m/s)', 'Fricção (Pa/m)')
+        self.tree = EditableTreeview(resultados_frame, columns=columns, show='headings', editable_columns=[])
+        self.tree.bind("<Return>", lambda e: self.adicionar_selecionado())
+        self.configure_treeview(self.tree, columns)
+        control_frame = ttk.Frame(right_frame)
+        control_frame.pack(pady=10)
+        actions = [
+            ('↑', self.mover_para_cima, "Mover para cima"),
+            ('↓', self.mover_para_baixo, "Mover para baixo"),
+            ('➕', self.adicionar_selecionado, "Adicionar selecionado"),
+            ('✖', self.remover_selecionado, "Remover selecionado"),
+            ('↔', self.trocar_largura_altura, "Inverter dimensões")
+        ]
+        for icon, cmd, tip in actions:
+            btn = ModernButton(control_frame, text=icon, command=cmd, width=3)
+            btn.pack(side=tk.LEFT, padx=2)
+            Tooltip(btn, tip)
+        selecao_frame = ttk.LabelFrame(right_frame, text="Resultados Escolhidos")
+        selecao_frame.pack(fill=tk.BOTH, expand=True)
+        columns_sel = ('Trecho', 'Vazão (m³/h)', 'Largura (mm)', 'Altura (mm)', 'Velocidade (m/s)', 'Fricção (Pa/m)')
+        self.tree_selecionados = EditableTreeview(selecao_frame, columns=columns_sel, show='headings', editable_columns=[0])
+        self.tree_selecionados.bind("<ButtonPress-2>", self.on_middle_press)
+        self.tree_selecionados.bind("<B2-Motion>", self.on_middle_drag)
+        self.tree_selecionados.bind("<ButtonRelease-2>", self.on_middle_release)
+        self.tree_selecionados.bind("<Return>", self.handle_enter)
+        self.tree_selecionados.bind("<Delete>", self.deletar_linha)
+        self.tree_selecionados.bind("<Tab>", self.handle_tab_press)
+        self.configure_treeview(self.tree_selecionados, columns_sel)
+
+    def create_entry(self, parent, label, default, tag):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(frame, text=label, width=LABEL_WIDTH, anchor=tk.W).pack(side=tk.LEFT)
+        entry = ttk.Entry(frame, style='Modern.TEntry', width=ENTRY_WIDTH)
+        entry.insert(0, default)
+        entry.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        self.entries[tag] = entry
+        return entry
+
+    def create_combobox(self, parent, label, values, default_index, width=LABEL_WIDTH, combo_width=ENTRY_WIDTH):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Label(frame, text=label, width=width, anchor=tk.W).pack(side=tk.LEFT)
+        container = ttk.Frame(frame)
+        container.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        combo = ttk.Combobox(container, values=values, style='Modern.TCombobox', width=combo_width)
+        combo.current(default_index)
+        combo.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+        return combo
+
+    def configure_treeview(self, tree, columns):
+        for col in columns:
+            tree.heading(col, text=col, anchor=tk.CENTER)
+            tree.column(col, width=120, anchor=tk.CENTER, stretch=tk.YES)
+        vsb = ttk.Scrollbar(tree.master, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.grid(row=0, column=0, sticky=tk.NSEW)
+        vsb.grid(row=0, column=1, sticky=tk.NS)
+        tree.master.grid_rowconfigure(0, weight=1)
+        tree.master.grid_columnconfigure(0, weight=1)
+
+    def carregar_defaults(self):
+        defaults = {
+            'vazao': '1000',
+            'temp': '25',
+            'vel_max': '15',
+            'perda_max': '1.3',
+            'perda_min': '1.0',
+            'w_max': '2000',
+            'w_min': '100',
+            'h_max': '2000',
+            'h_min': '100',
+            'max_ratio': '3.0'
+        }
+        for key, value in defaults.items():
+            if key in self.entries:
+                self.entries[key].delete(0, tk.END)
+                self.entries[key].insert(0, value)
+
+    def calcular(self):
+        try:
+            parametros = {
+                'perda_max': float(self.entries['perda_max'].get()),
+                'perda_min': float(self.entries['perda_min'].get()),
+                'Q': float(self.entries['vazao'].get()),
+                'temp': float(self.entries['temp'].get()),
+                'w_max': int(self.entries['w_max'].get()),
+                'w_min': int(self.entries['w_min'].get()),
+                'h_max': int(self.entries['h_max'].get()),
+                'h_min': int(self.entries['h_min'].get()),
+                'max_ratio': float(self.entries['max_ratio'].get())
+            }
+            self.q_value = parametros['Q']
+            v_max = float(self.entries['vel_max'].get())
+            resultados = dimensionar_duto(
+                ΔP_min=parametros['perda_min'],
+                ΔP_max=parametros['perda_max'],
+                temp=parametros['temp'],
+                Q=parametros['Q'],
+                metodo=self.metodo.get(),
+                material=self.material.get(),
+                w_min=parametros['w_min'],
+                w_max=parametros['w_max'],
+                h_min=parametros['h_min'],
+                h_max=parametros['h_max'],
+                max_ratio=parametros['max_ratio'],
+                v_max=v_max
+            )
+            self.tree.delete(*self.tree.get_children())
+            for res in sorted(resultados, key=lambda x: x[0]):
+                self.tree.insert('', 'end', values=(res[0], res[1], f"{res[2]:.2f}", f"{res[3]:.2f}"))
+        except ValueError as e:
+            messagebox.showerror("Erro de Entrada", f"Valor inválido: {str(e)}")
+
+    def adicionar_selecionado(self):
+        for item in self.tree.selection():
+            valores = list(self.tree.item(item, 'values'))
+            nova_linha = ["", f"{self.q_value}", valores[0], valores[1], valores[2], valores[3]]
+            self.tree_selecionados.insert('', 'end', values=nova_linha)
+
+    def remover_selecionado(self):
+        for item in list(self.tree_selecionados.selection()):
+            self.tree_selecionados.delete(item)
+
+    def trocar_largura_altura(self):
+        selecionados = self.tree_selecionados.selection()
+        for item in selecionados:
+            valores = list(self.tree_selecionados.item(item, 'values'))
+            valores[2], valores[3] = valores[3], valores[2]
+            self.tree_selecionados.item(item, values=valores)
+
+    def mover_para_cima(self):
+        selecionados = self.tree_selecionados.selection()
+        for item in selecionados:
+            index = self.tree_selecionados.index(item)
+            if index > 0:
+                self.tree_selecionados.move(item, '', index-1)
+
+    def mover_para_baixo(self):
+        selecionados = self.tree_selecionados.selection()
+        for item in reversed(selecionados):
+            index = self.tree_selecionados.index(item)
+            if index < len(self.tree_selecionados.get_children())-1:
+                self.tree_selecionados.move(item, '', index+1)
+
+    def handle_enter(self, event):
+        if self.tree_selecionados.editing:
+            return
+        selected = self.tree_selecionados.selection()
+        if not selected:
+            return
+        row_id = selected[0]
+        editable_columns = self.tree_selecionados.editable_columns
+        if not editable_columns:
+            return
+        column_index = editable_columns[0]
+        self.tree_selecionados.start_edit(row_id, column_index)
+        return "break"
+
+    def handle_tab_press(self, event):
+        self.trocar_largura_altura()
+        return 'break'
+
+    def on_middle_press(self, event):
+        self._drag_start_y = event.y
+        self._last_drag_y = event.y
+        self._accumulated_delta = 0
+
+    def on_middle_drag(self, event):
+        if not hasattr(self, '_drag_start_y'):
+            return
+        current_y = event.y
+        delta = current_y - self._last_drag_y
+        self._last_drag_y = current_y
+        self._accumulated_delta += delta
+        threshold = 30
+        while self._accumulated_delta <= -threshold:
+            self.mover_para_cima()
+            self._accumulated_delta += threshold
+        while self._accumulated_delta >= threshold:
+            self.mover_para_baixo()
+            self._accumulated_delta -= threshold
+
+    def on_middle_release(self, event):
+        if hasattr(self, '_drag_start_y'):
+            del self._drag_start_y
+            del self._last_drag_y
+            del self._accumulated_delta
+
+    def salvar(self):
+        if self.current_file:
+            try:
+                with open(self.current_file, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f, delimiter=';')
+                    writer.writerow(['Trecho', 'Vazão (m³/h)', 'Largura (mm)', 'Altura (mm)', 'Velocidade (m/s)', 'Fricção (Pa/m)'])
+                    for item in self.tree_selecionados.get_children():
+                        writer.writerow(self.tree_selecionados.item(item, 'values'))
+                messagebox.showinfo("Sucesso", "Dados salvos com sucesso!")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao salvar arquivo:\n{str(e)}")
+        else:
+            self.salvar_como()
+
+    def salvar_como(self):
+        filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("Arquivos CSV", "*.csv")])
+        if filename:
+            self.current_file = filename
+            self.salvar()
+
+    def importar_csv(self):
+        filename = filedialog.askopenfilename(filetypes=[("Arquivos CSV", "*.csv")])
+        if filename:
+            try:
+                with open(filename, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f, delimiter=';')
+                    next(reader)
+                    self.tree_selecionados.delete(*self.tree_selecionados.get_children())
+                    for row in reader:
+                        if len(row) == 6:
+                            formatted_row = [
+                                row[0],
+                                f"{float(row[1]):.2f}",
+                                f"{int(float(row[2]))}",
+                                f"{int(float(row[3]))}",
+                                f"{float(row[4]):.2f}",
+                                f"{float(row[5]):.2f}"
+                            ]
+                            self.tree_selecionados.insert('', 'end', values=formatted_row)
+                messagebox.showinfo("Sucesso", "Dados importados com sucesso!")
+            except Exception as e:
+                messagebox.showerror("Erro", f"Falha ao importar arquivo:\n{str(e)}")
+
+    def mover_para_cima_tecla(self, event):
+        current_selection = self.tree_selecionados.selection()
+        if not current_selection:
+            children = self.tree_selecionados.get_children()
+            if children:
+                self.tree_selecionados.selection_set(children[0])
+                self.tree_selecionados.focus(children[0])
+            return
+        current_item = current_selection[0]
+        prev_item = self.tree_selecionados.prev(current_item)
+        if prev_item:
+            self.tree_selecionados.selection_set(prev_item)
+            self.tree_selecionados.focus(prev_item)
+        return "break"
+
+    def mover_para_baixo_tecla(self, event):
+        current_selection = self.tree_selecionados.selection()
+        if not current_selection:
+            children = self.tree_selecionados.get_children()
+            if children:
+                self.tree_selecionados.selection_set(children[0])
+                self.tree_selecionados.focus(children[0])
+            return
+        current_item = current_selection[0]
+        next_item = self.tree_selecionados.next(current_item)
+        if next_item:
+            self.tree_selecionados.selection_set(next_item)
+            self.tree_selecionados.focus(next_item)
+        return "break"
+
+    def deletar_linha(self, event):
+        for item in list(self.tree_selecionados.selection()):
+            self.tree_selecionados.delete(item)
+
+    def gerar_planilha_personalizada(self):
+        filename = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Arquivos Excel", "*.xlsx")])
+        if not filename:
+            return
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Resultados Escolhidos"
+
+            # Estilo unificado para cabeçalhos
+            header_font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+            header_fill = PatternFill(start_color="007ACC", end_color="007ACC", fill_type="solid")
+            # Estilo para os valores dos parâmetros e dos resultados: fundo branco, texto preto
+            value_font = Font(bold=False, color="000000", name="Calibri", size=11)
+            data_fill = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+            alignment = Alignment(horizontal="center", vertical="center")
+            thin_border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                 top=Side(style='thin'), bottom=Side(style='thin'))
+
+            params = {
+                "Vazão (m³/h):": self.entries['vazao'].get(),
+                "Temperatura (°C):": self.entries['temp'].get(),
+                "Velocidade Limite (m/s):": self.entries['vel_max'].get(),
+                "Fricção Máxima (Pa/m):": self.entries['perda_max'].get(),
+                "Fricção Mínima (Pa/m):": self.entries['perda_min'].get(),
+                "Material do Duto:": self.material.get(),
+                "Fator de Atrito:": self.metodo.get()
+            }
+            row_idx = 1
+            ws.column_dimensions['A'].width = 30
+            ws.column_dimensions['B'].width = 18
+            for key, val in params.items():
+                cell_key = ws.cell(row=row_idx, column=1, value=key)
+                cell_key.font = header_font
+                cell_key.fill = header_fill
+                cell_key.alignment = alignment
+                cell_key.border = thin_border
+
+                try:
+                    num = float(val)
+                    val_formatted = f"{num:.2f}".replace('.', ',')
+                except:
+                    val_formatted = str(val)
+                cell_val = ws.cell(row=row_idx, column=2, value=val_formatted)
+                cell_val.font = value_font
+                cell_val.fill = data_fill
+                cell_val.alignment = alignment
+                cell_val.border = thin_border
+                row_idx += 1
+
+            row_idx += 1  # Linha em branco
+
+            # Cabeçalho dos resultados
+            headers = ['Trecho', 'Vazão (m³/h)', 'Largura (mm)', 'Altura (mm)', 'Velocidade (m/s)', 'Fricção (Pa/m)', 'Comprimento (m)', 'Perda (Pa)']
+            for col_num, header_text in enumerate(headers, start=1):
+                cell = ws.cell(row=row_idx, column=col_num, value=header_text)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = alignment
+                cell.border = thin_border
+                ws.column_dimensions[cell.column_letter].width = 18
+
+            def format_decimal(val):
+                try:
+                    num = float(val)
+                    return f"{num:.2f}".replace('.', ',')
+                except:
+                    return str(val)
+
+            # Preenche os resultados a partir da linha seguinte
+            for r, item in enumerate(self.tree_selecionados.get_children(), start=row_idx+1):
+                valores = list(self.tree_selecionados.item(item, 'values'))
+                nova_linha = valores[:5] + [valores[5]] + ["", ""]
+                for col_idx, value in enumerate(nova_linha, start=1):
+                    cell = ws.cell(row=r, column=col_idx, value=format_decimal(value))
+                    cell.font = value_font
+                    cell.fill = data_fill
+                    cell.alignment = alignment
+                    cell.border = thin_border
+
+            wb.save(filename)
+            messagebox.showinfo("Sucesso", "Planilha personalizada gerada com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao gerar planilha:\n{str(e)}")
+
+    def center_window(self):
+        self.update_idletasks()
+        width = self.winfo_width()
+        height = self.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f'{width}x{height}+{x}+{y}')
+
+    def adicionar_watermark(self):
+        self.watermark = ttk.Label(self, text="⚙️ DuctFlow 1.0 | David Diogenes ®",
+                                     style='Watermark.TLabel', font=('Segoe UI', 8),
+                                     foreground='#888888', anchor='e')
+        self.watermark.place(relx=1, rely=1, anchor='se')
+
+    def on_closing(self):
+        if messagebox.askyesno("Confirmação", "Deseja salvar o arquivo antes de fechar?"):
+            self.salvar()
+        self.destroy()
+
+if __name__ == "__main__":
+    app = DuctFlow()
+    app.mainloop()
